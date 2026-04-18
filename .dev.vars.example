@@ -1,0 +1,18 @@
+# LinkedBoost AI - Environment Variables Template
+# Copy this file to .dev.vars and fill in your credentials
+# .dev.vars is gitignored and never committed
+
+# Groq AI (get from console.groq.com)
+GROQ_API_KEY=gsk_YOUR_GROQ_API_KEY_HERE
+
+# Twilio SMS OTP (get from console.twilio.com)
+TWILIO_ACCOUNT_SID=AC_YOUR_ACCOUNT_SID_HERE
+TWILIO_AUTH_TOKEN=YOUR_AUTH_TOKEN_HERE
+TWILIO_SERVICE_SID=VA_YOUR_SERVICE_SID_HERE
+
+# Gmail SMTP (use App Password from myaccount.google.com/apppasswords)
+SMTP_EMAIL=your@gmail.com
+SMTP_PASSWORD=xxxx xxxx xxxx xxxx
+
+# JWT Secret (any random string)
+JWT_SECRET=linkedboost-ai-secret-2025

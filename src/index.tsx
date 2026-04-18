@@ -16,6 +16,30 @@ const app = new Hono<{ Bindings: Bindings }>()
 app.use('*', cors())
 app.use('/static/*', serveStatic({ root: './' }))
 
+// ─── ENV RESOLVER: reads from CF bindings OR process.env fallback ─────────────
+function getEnv(cfEnv: Bindings, key: keyof Bindings): string {
+  // Cloudflare Workers binding takes priority
+  if (cfEnv && cfEnv[key]) return cfEnv[key]
+  // Fallback to process.env (Node.js / PM2 / wrangler pages dev)
+  try {
+    const val = (globalThis as any).process?.env?.[key]
+    if (val) return val
+  } catch {}
+  return ''
+}
+
+function resolveEnv(cfEnv: Bindings): Bindings {
+  return {
+    GROQ_API_KEY: getEnv(cfEnv, 'GROQ_API_KEY'),
+    TWILIO_ACCOUNT_SID: getEnv(cfEnv, 'TWILIO_ACCOUNT_SID'),
+    TWILIO_SERVICE_SID: getEnv(cfEnv, 'TWILIO_SERVICE_SID'),
+    TWILIO_AUTH_TOKEN: getEnv(cfEnv, 'TWILIO_AUTH_TOKEN'),
+    SMTP_EMAIL: getEnv(cfEnv, 'SMTP_EMAIL'),
+    SMTP_PASSWORD: getEnv(cfEnv, 'SMTP_PASSWORD'),
+    JWT_SECRET: getEnv(cfEnv, 'JWT_SECRET'),
+  }
+}
+
 // ─── GROQ AI HELPER ───────────────────────────────────────────────────────────
 async function callGroq(apiKey: string, systemPrompt: string, userPrompt: string, model = 'llama-3.3-70b-versatile') {
   try {
@@ -39,33 +63,66 @@ async function callGroq(apiKey: string, systemPrompt: string, userPrompt: string
   }
 }
 
-// ─── EMAIL HELPER (via Mailgun-compatible fetch) ──────────────────────────────
-async function sendEmail(env: Bindings, to: string, subject: string, html: string) {
-  try {
-    // Using Gmail SMTP via fetch-compatible relay (encode as base64 for CF Workers)
-    // In production integrate a proper email service like Resend or SendGrid
-    const raw = [
-      `From: LinkedBoost AI <${env.SMTP_EMAIL}>`,
-      `To: ${to}`,
-      `Subject: ${subject}`,
-      'MIME-Version: 1.0',
-      'Content-Type: text/html; charset=UTF-8',
-      '',
-      html
-    ].join('\r\n')
-    const encoded = btoa(raw)
-    return { success: true, encoded, message: 'Email queued' }
-  } catch {
-    return { success: false }
+// ─── EMAIL HELPER via Nodemailer + Gmail App Password (works in wrangler pages dev) ──
+async function sendEmailViaSMTP(env: Bindings, to: string, subject: string, htmlBody: string, _otp?: string): Promise<{success:boolean; provider?: string; error?: string}> {
+  const resolvedEnv = resolveEnv(env)
+  const smtpEmail = resolvedEnv.SMTP_EMAIL
+  const smtpPass  = resolvedEnv.SMTP_PASSWORD?.replace(/\s/g, '') // remove spaces from app password
+  if (!smtpEmail || !smtpPass) {
+    return { success: false, provider: 'none', error: 'SMTP credentials missing' }
   }
+  try {
+    // Dynamic import of nodemailer (Node.js compat - works in wrangler pages dev)
+    const nodemailer = await import('nodemailer' as any)
+    const transporter = nodemailer.createTransport({
+      service: 'gmail',
+      auth: { user: smtpEmail, pass: smtpPass }
+    })
+    await transporter.sendMail({
+      from: `LinkedBoost AI <${smtpEmail}>`,
+      to,
+      subject,
+      html: htmlBody
+    })
+    return { success: true, provider: 'gmail-smtp' }
+  } catch (e: any) {
+    // Fallback: also try via fetch to a free relay
+    try {
+      const mcRes = await fetch('https://api.mailchannels.net/tx/v1/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          personalizations: [{ to: [{ email: to }] }],
+          from: { email: smtpEmail, name: 'LinkedBoost AI' },
+          subject,
+          content: [{ type: 'text/html', value: htmlBody }]
+        })
+      })
+      if (mcRes.ok || mcRes.status === 202) return { success: true, provider: 'mailchannels' }
+    } catch {}
+    return { success: false, provider: 'ui-fallback', error: e?.message }
+  }
+}
+
+// Alias for backward compat
+async function sendEmail(env: Bindings, to: string, subject: string, htmlBody: string): Promise<{success:boolean; error?:string}> {
+  const result = await sendEmailViaSMTP(env, to, subject, htmlBody)
+  return { success: result.success, error: result.error }
 }
 
 // ─── TWILIO OTP ────────────────────────────────────────────────────────────────
 async function sendOTP(env: Bindings, phone: string) {
+  const sid     = env.TWILIO_ACCOUNT_SID
+  const token   = env.TWILIO_AUTH_TOKEN
+  const service = env.TWILIO_SERVICE_SID
+  // Check for placeholder/missing token
+  if (!token || token === 'YOUR_TWILIO_AUTH_TOKEN_HERE' || token === 'PLACEHOLDER_SET_ACTUAL_TOKEN') {
+    return { success: false, error: 'Twilio Auth Token not configured. Please set TWILIO_AUTH_TOKEN in ecosystem.config.cjs.' }
+  }
   try {
-    const auth = btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`)
+    const auth = btoa(`${sid}:${token}`)
     const res = await fetch(
-      `https://verify.twilio.com/v2/Services/${env.TWILIO_SERVICE_SID}/Verifications`,
+      `https://verify.twilio.com/v2/Services/${service}/Verifications`,
       {
         method: 'POST',
         headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -73,17 +130,24 @@ async function sendOTP(env: Bindings, phone: string) {
       }
     )
     const data: any = await res.json()
-    return { success: data.status === 'pending', sid: data.sid }
-  } catch {
-    return { success: false }
+    if (data.status === 'pending') return { success: true, sid: data.sid }
+    return { success: false, error: data.message || 'Twilio error', twilioCode: data.code }
+  } catch(e: any) {
+    return { success: false, error: e?.message || 'Network error' }
   }
 }
 
 async function verifyOTP(env: Bindings, phone: string, code: string) {
+  const sid     = env.TWILIO_ACCOUNT_SID
+  const token   = env.TWILIO_AUTH_TOKEN
+  const service = env.TWILIO_SERVICE_SID
+  if (!token || token === 'YOUR_TWILIO_AUTH_TOKEN_HERE' || token === 'PLACEHOLDER_SET_ACTUAL_TOKEN') {
+    return { success: false, valid: false, error: 'Twilio Auth Token not configured' }
+  }
   try {
-    const auth = btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`)
+    const auth = btoa(`${sid}:${token}`)
     const res = await fetch(
-      `https://verify.twilio.com/v2/Services/${env.TWILIO_SERVICE_SID}/VerificationCheck`,
+      `https://verify.twilio.com/v2/Services/${service}/VerificationCheck`,
       {
         method: 'POST',
         headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -92,8 +156,8 @@ async function verifyOTP(env: Bindings, phone: string, code: string) {
     )
     const data: any = await res.json()
     return { success: data.status === 'approved', valid: data.valid }
-  } catch {
-    return { success: false, valid: false }
+  } catch(e: any) {
+    return { success: false, valid: false, error: e?.message }
   }
 }
 
@@ -226,7 +290,8 @@ app.post('/api/analyze', async (c) => {
   if (!linkedinUrl || !linkedinUrl.includes('linkedin.com/in/')) {
     return c.json({ success: false, error: 'Please enter a valid LinkedIn profile URL (e.g. linkedin.com/in/yourname)' }, 400)
   }
-  const result = await analyzeLinkedInProfile(c.env, linkedinUrl)
+  const env = resolveEnv(c.env)
+  const result = await analyzeLinkedInProfile(env, linkedinUrl)
   return c.json(result)
 })
 
@@ -234,7 +299,15 @@ app.post('/api/analyze', async (c) => {
 app.post('/api/auth/send-otp', async (c) => {
   const { phone } = await c.req.json()
   if (!phone) return c.json({ success: false, error: 'Phone number required' }, 400)
-  const result = await sendOTP(c.env, phone)
+  const env = resolveEnv(c.env)
+  // Debug: log resolved credentials (remove in prod)
+  const hasCreds = !!(env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN && env.TWILIO_SERVICE_SID)
+  if (!hasCreds) {
+    return c.json({ success: false, error: 'Twilio credentials not configured', debug: {
+      sid: !!env.TWILIO_ACCOUNT_SID, token: !!env.TWILIO_AUTH_TOKEN, service: !!env.TWILIO_SERVICE_SID
+    }})
+  }
+  const result = await sendOTP(env, phone)
   return c.json(result)
 })
 
@@ -242,7 +315,8 @@ app.post('/api/auth/send-otp', async (c) => {
 app.post('/api/auth/verify-otp', async (c) => {
   const { phone, code } = await c.req.json()
   if (!phone || !code) return c.json({ success: false, error: 'Phone and code required' }, 400)
-  const result = await verifyOTP(c.env, phone, code)
+  const env = resolveEnv(c.env)
+  const result = await verifyOTP(env, phone, code)
   return c.json(result)
 })
 
@@ -250,8 +324,10 @@ app.post('/api/auth/verify-otp', async (c) => {
 app.post('/api/auth/send-email-otp', async (c) => {
   const { email } = await c.req.json()
   if (!email) return c.json({ success: false, error: 'Email required' }, 400)
+  const env = resolveEnv(c.env)
   const otp = Math.floor(100000 + Math.random() * 900000).toString()
-  const html = `<div style="font-family:Inter,sans-serif;max-width:500px;margin:0 auto;background:#0f172a;color:#e2e8f0;padding:40px;border-radius:16px;">
+
+  const htmlBody = `<div style="font-family:Inter,sans-serif;max-width:500px;margin:0 auto;background:#0f172a;color:#e2e8f0;padding:40px;border-radius:16px;">
     <div style="text-align:center;margin-bottom:30px;">
       <div style="font-size:32px;margin-bottom:8px;">&#x1F680;</div>
       <h1 style="color:#0077B5;margin:0;font-size:24px;">LinkedBoost AI</h1>
@@ -263,20 +339,35 @@ app.post('/api/auth/send-email-otp', async (c) => {
     </div>
     <p style="color:#64748b;font-size:12px;text-align:center;">If you did not request this, please ignore this email.</p>
   </div>`
-  await sendEmail(c.env, email, 'LinkedBoost AI - Verification Code', html)
-  return c.json({ success: true, otp, message: 'OTP sent to email' })
+
+  // Try to actually send via MailChannels (Cloudflare-native free relay)
+  const sent = await sendEmailViaSMTP(env, email, 'LinkedBoost AI - Your Verification Code', htmlBody, otp)
+
+  // Always return the OTP in the response so the frontend can show it as a fallback
+  // This is safe for demo/sandbox - in production remove `otp` from response
+  return c.json({
+    success: true,
+    otp,
+    emailSent: sent.success,
+    provider: sent.provider,
+    message: sent.success ? `OTP sent to ${email}` : `OTP generated (check screen - email delivery pending)`,
+    // Store OTP server-side in production (KV with TTL). For demo: client validates.
+    expiresIn: 600
+  })
 })
 
 // PAID: Generate Strategy
 app.post('/api/strategy/generate', async (c) => {
   const { linkedinUrl, analysis, objective } = await c.req.json()
-  const strategy = await generateStrategy(c.env, linkedinUrl, analysis, objective || 'network_building')
+  const env = resolveEnv(c.env)
+  const strategy = await generateStrategy(env, linkedinUrl, analysis, objective || 'network_building')
   return c.json({ success: true, strategy })
 })
 
 // PAID: Generate Content
 app.post('/api/content/generate', async (c) => {
   const { topic, contentType, objective, tone, profile } = await c.req.json()
+  const env = resolveEnv(c.env)
 
   const systemPrompt = `You are an elite LinkedIn content strategist who creates viral, high-engagement posts.
 IMPORTANT: Respond with ONLY valid JSON, no markdown, no code blocks.`
@@ -290,7 +381,7 @@ Profile: ${profile?.name || 'Professional'} in ${profile?.inferredIndustry || 'T
 Return ONLY this JSON:
 {"contents":[{"id":"c1","type":"post","title":"compelling hook","body":"Full post with emojis and line breaks. Write naturally, make it engaging and authentic. Include a call to action at the end.","hashtags":["#Tag1","#Tag2","#Tag3"],"estimatedReach":"2,400-4,800","engagementPrediction":"High","bestPostTime":"Tuesday 8:00 AM","contentScore":88,"whyItWorks":"brief explanation of why this will perform well"},{"id":"c2","type":"post","title":"second hook","body":"Second post variation with different angle","hashtags":["#Tag1","#Tag2","#Tag3"],"estimatedReach":"3,000-6,000","engagementPrediction":"Very High","bestPostTime":"Wednesday 9:00 AM","contentScore":92,"whyItWorks":"why this works"},{"id":"c3","type":"article","title":"article title","body":"Full article outline with 3 main sections","hashtags":["#Tag1","#Tag2","#Tag3"],"estimatedReach":"8,000-15,000","engagementPrediction":"Very High","bestPostTime":"Wednesday 10:00 AM","contentScore":94,"whyItWorks":"why this works"}]}`
 
-  const result = await callGroq(c.env.GROQ_API_KEY, systemPrompt, userPrompt)
+  const result = await callGroq(env.GROQ_API_KEY, systemPrompt, userPrompt)
   try {
     const cleaned = result.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim()
     const parsed = JSON.parse(cleaned)
@@ -323,7 +414,8 @@ Industry: ${analysis?.inferredIndustry || 'Technology'}
 Return ONLY this JSON:
 {"date":"${today}","theme":"daily theme","tasks":[{"time":"7:30 AM","category":"publish","task":"Publish scheduled post","detail":"Post the pre-approved thought leadership content","automated":true,"requiresApproval":false,"estimatedMinutes":2,"impactScore":9},{"time":"9:00 AM","category":"connect","task":"Send 10 connection requests","detail":"Target CTOs and VPs in your industry","automated":true,"requiresApproval":true,"estimatedMinutes":10,"impactScore":7},{"time":"11:00 AM","category":"engage","task":"Comment on 5 trending posts","detail":"Add thoughtful 3-4 sentence comments on viral posts in your niche","automated":false,"requiresApproval":false,"estimatedMinutes":15,"impactScore":8},{"time":"1:00 PM","category":"respond","task":"Reply to all comments","detail":"Respond within 2 hours to boost algorithm visibility","automated":false,"requiresApproval":false,"estimatedMinutes":10,"impactScore":9},{"time":"5:00 PM","category":"analyze","task":"Review daily analytics","detail":"Check impressions, engagement, and follower growth","automated":true,"requiresApproval":false,"estimatedMinutes":5,"impactScore":6}],"contentToPost":{"type":"post","suggestedTopic":"Industry insight or personal lesson","hook":"Start with a bold statement or surprising statistic"},"connectionTargets":["Senior leaders in your industry","Recruiters at target companies","Peer professionals and collaborators"],"engagementTargets":["Posts with 100+ likes in your niche","Content from industry influencers and thought leaders"],"dailyGoal":"Reach 500+ impressions today and gain 5 new followers","motivationalNote":"Every post you publish is a seed. Consistency creates the forest."}`
 
-  const result = await callGroq(c.env.GROQ_API_KEY, systemPrompt, userPrompt)
+  const env2 = resolveEnv(c.env)
+  const result = await callGroq(env2.GROQ_API_KEY, systemPrompt, userPrompt)
   try {
     const cleaned = result.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim()
     return c.json({ success: true, plan: JSON.parse(cleaned) })
@@ -1544,12 +1636,17 @@ async function sendSmsOtp() {
     if (res.data.success) {
       document.getElementById('otp-sent-to').textContent = 'Code sent to ' + fullPhone;
       showAuthStep('otp');
-      showNotif('OTP sent successfully!', 'success');
+      showNotif('OTP sent to ' + fullPhone, 'success');
     } else {
-      showNotif('Failed to send OTP. Check phone number.', 'error');
+      var errMsg = res.data.error || 'Failed to send OTP';
+      // Provide actionable message for auth token issue
+      if (errMsg.includes('Auth Token') || errMsg.includes('TWILIO_AUTH_TOKEN') || res.data.twilioCode === 20003) {
+        errMsg = 'SMS not configured yet. Please use Email OTP instead.';
+      }
+      showNotif(errMsg, 'error');
     }
   } catch(e) {
-    showNotif('SMS service error. Try email verification.', 'error');
+    showNotif('SMS service unavailable. Please use Email OTP.', 'error');
   }
 }
 
@@ -1562,15 +1659,38 @@ async function sendEmailOtp() {
   try {
     var res = await axios.post('/api/auth/send-email-otp', { email: email });
     if (res.data.success) {
+      // Store OTP for local verification
+      APP.emailOtpCode = String(res.data.otp || '');
       document.getElementById('otp-sent-to').textContent = 'Code sent to ' + email;
-      // For demo: show OTP in notification
-      showNotif('OTP sent! Demo code: ' + (res.data.otp || '------'), 'success');
       showAuthStep('otp');
+      if (res.data.emailSent && res.data.provider === 'gmail-smtp') {
+        // Real email sent via Gmail SMTP
+        showNotif('✅ OTP sent to ' + email + '! Check your inbox.', 'success');
+        showOtpBanner(String(res.data.otp || ''), true);
+      } else if (res.data.emailSent) {
+        showNotif('OTP sent to ' + email + '! Check your inbox.', 'success');
+        showOtpBanner(String(res.data.otp || ''), true);
+      } else {
+        // Email delivery pending - show OTP prominently on screen
+        showOtpBanner(String(res.data.otp || ''), false);
+        showNotif('Your verification code: ' + res.data.otp + ' (also check your email)', 'info');
+      }
     } else {
-      showNotif('Failed to send email OTP', 'error');
+      showNotif('Failed to generate OTP. Please try again.', 'error');
     }
   } catch(e) {
-    showNotif('Email service error', 'error');
+    showNotif('Server error. Please try again.', 'error');
+  }
+}
+
+function showOtpBanner(otp, emailSent) {
+  var banner = document.getElementById('otp-banner');
+  var bannerCode = document.getElementById('otp-banner-code');
+  var bannerMsg = document.getElementById('otp-banner-msg');
+  if (banner && bannerCode) {
+    bannerCode.textContent = otp;
+    if (bannerMsg) bannerMsg.textContent = emailSent ? 'Also sent to your email inbox' : 'Use this code to verify (email delivery pending)';
+    banner.classList.remove('hidden');
   }
 }
 
@@ -1600,25 +1720,40 @@ async function verifyOtp() {
       var res = await axios.post('/api/auth/verify-otp', { phone: APP.otpPhone, code: code });
       verified = res.data.success || res.data.valid;
     } else {
-      // For email OTP demo: any 6-digit code passes (replace with real verification)
-      verified = code.length === 6;
+      // Email OTP: verify against stored code from server response
+      if (APP.emailOtpCode && code === APP.emailOtpCode) {
+        verified = true;
+      } else if (!APP.emailOtpCode && code.length === 6) {
+        // Fallback: if OTP not stored locally, accept any 6-digit code
+        verified = true;
+      } else {
+        verified = false;
+      }
     }
 
     if (verified) {
       showNotif('Verified! Welcome to LinkedBoost AI', 'success');
-      if (APP.linkedinUrl) {
-        showPage('page-objective');
-      } else {
-        showPage('page-analyze');
-      }
+      navigateAfterAuth();
     } else {
       showNotif('Invalid OTP. Please try again.', 'error');
     }
   } catch(e) {
     // Demo fallback: allow any 6-digit code
     showNotif('Verified! Welcome to LinkedBoost AI', 'success');
-    if (APP.linkedinUrl) { showPage('page-objective'); }
-    else { showPage('page-analyze'); }
+    navigateAfterAuth();
+  }
+}
+
+function navigateAfterAuth() {
+  // If user already has a LinkedIn URL + analysis -> go to objective selection
+  if (APP.linkedinUrl && APP.analysis) {
+    showPage('page-objective');
+  } else if (APP.plan === 'pro' || APP.plan === 'enterprise') {
+    // Paid plan: go to analyze first to get profile, then objective, then dashboard
+    showPage('page-analyze');
+  } else {
+    // Free plan or no context: go to analyze
+    showPage('page-analyze');
   }
 }
 
@@ -1778,9 +1913,16 @@ function showAnalysisError(msg) {
 }
 
 function goToPro() {
-  if (!APP.user) { showSignup('pro'); }
-  else if (APP.linkedinUrl && APP.analysis) { showPage('page-objective'); }
-  else { showPage('page-pricing'); }
+  if (!APP.user) {
+    // Save the LinkedIn URL if already analyzed, then show signup
+    showSignup('pro');
+  } else if (APP.linkedinUrl && APP.analysis) {
+    // Already analyzed: go straight to objective selection
+    showPage('page-objective');
+  } else {
+    // Logged in but no analysis: go to analyze page
+    showPage('page-analyze');
+  }
 }
 
 // ─── OBJECTIVE SELECTION ──────────────────────────────────────────────────────
