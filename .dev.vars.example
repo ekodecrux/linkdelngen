@@ -16,3 +16,7 @@ SMTP_PASSWORD=xxxx xxxx xxxx xxxx
 
 # JWT Secret (any random string)
 JWT_SECRET=linkedboost-ai-secret-2025
+
+# Razorpay Payment Gateway (get from dashboard.razorpay.com)
+RAZORPAY_KEY_ID=rzp_test_YOUR_KEY_ID
+RAZORPAY_KEY_SECRET=YOUR_KEY_SECRET

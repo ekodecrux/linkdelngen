@@ -10,6 +10,8 @@ type Bindings = {
   SMTP_EMAIL: string
   SMTP_PASSWORD: string
   JWT_SECRET: string
+  RAZORPAY_KEY_ID: string
+  RAZORPAY_KEY_SECRET: string
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
@@ -37,6 +39,8 @@ function resolveEnv(cfEnv: Bindings): Bindings {
     SMTP_EMAIL: getEnv(cfEnv, 'SMTP_EMAIL'),
     SMTP_PASSWORD: getEnv(cfEnv, 'SMTP_PASSWORD'),
     JWT_SECRET: getEnv(cfEnv, 'JWT_SECRET'),
+    RAZORPAY_KEY_ID: getEnv(cfEnv, 'RAZORPAY_KEY_ID'),
+    RAZORPAY_KEY_SECRET: getEnv(cfEnv, 'RAZORPAY_KEY_SECRET'),
   }
 }
 
@@ -492,6 +496,165 @@ app.get('/api/network/suggestions', async (c) => {
   })
 })
 
+// ─── RAZORPAY PAYMENT ROUTES ──────────────────────────────────────────────────
+
+// Plan pricing (in paise — INR smallest unit; 1 INR = 100 paise)
+const PLAN_PRICES: Record<string, { amount: number; currency: string; name: string }> = {
+  pro:        { amount: 2900 * 100, currency: 'INR', name: 'LinkedBoost Pro' },
+  enterprise: { amount: 9900 * 100, currency: 'INR', name: 'LinkedBoost Enterprise' }
+}
+
+// Create Razorpay Order
+app.post('/api/payment/create-order', async (c) => {
+  try {
+    const { plan, userEmail, userName } = await c.req.json()
+    const env = resolveEnv(c.env)
+
+    if (!env.RAZORPAY_KEY_ID || !env.RAZORPAY_KEY_SECRET) {
+      return c.json({ success: false, error: 'Payment service not configured' }, 500)
+    }
+
+    const pricing = PLAN_PRICES[plan]
+    if (!pricing) return c.json({ success: false, error: 'Invalid plan' }, 400)
+
+    // Call Razorpay Orders API
+    const auth = btoa(`${env.RAZORPAY_KEY_ID}:${env.RAZORPAY_KEY_SECRET}`)
+    const receiptId = `lb_${plan}_${Date.now()}`
+
+    const res = await fetch('https://api.razorpay.com/v1/orders', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        amount: pricing.amount,
+        currency: pricing.currency,
+        receipt: receiptId,
+        notes: {
+          plan,
+          userEmail: userEmail || '',
+          userName: userName || '',
+          product: 'LinkedBoost AI'
+        }
+      })
+    })
+
+    const order: any = await res.json()
+    if (!res.ok || order.error) {
+      return c.json({ success: false, error: order.error?.description || 'Failed to create order' }, 500)
+    }
+
+    return c.json({
+      success: true,
+      orderId: order.id,
+      amount: order.amount,
+      currency: order.currency,
+      keyId: env.RAZORPAY_KEY_ID,
+      planName: pricing.name,
+      plan
+    })
+  } catch (e: any) {
+    return c.json({ success: false, error: e?.message || 'Payment init failed' }, 500)
+  }
+})
+
+// Verify Razorpay Payment Signature
+app.post('/api/payment/verify', async (c) => {
+  try {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, plan, userEmail } = await c.req.json()
+    const env = resolveEnv(c.env)
+
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      return c.json({ success: false, error: 'Missing payment details' }, 400)
+    }
+
+    // Verify HMAC-SHA256 signature
+    const crypto = await import('node:crypto' as any)
+    const expectedSig = crypto.createHmac('sha256', env.RAZORPAY_KEY_SECRET)
+      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+      .digest('hex')
+
+    const isValid = expectedSig === razorpay_signature
+
+    if (!isValid) {
+      return c.json({ success: false, error: 'Payment signature verification failed', verified: false }, 400)
+    }
+
+    // Payment verified! Send confirmation email
+    const pricing = PLAN_PRICES[plan] || PLAN_PRICES['pro']
+    const amountDisplay = `₹${(pricing.amount / 100).toLocaleString('en-IN')}`
+
+    if (userEmail) {
+      const emailHtml = `<div style="font-family:Inter,sans-serif;max-width:560px;margin:0 auto;background:#0f172a;color:#e2e8f0;padding:40px;border-radius:16px;">
+        <div style="text-align:center;margin-bottom:30px;">
+          <div style="font-size:48px;margin-bottom:12px;">🎉</div>
+          <h1 style="color:#0077B5;margin:0 0 6px 0;font-size:26px;">Welcome to LinkedBoost AI ${plan === 'enterprise' ? 'Enterprise' : 'Pro'}!</h1>
+          <p style="color:#94a3b8;font-size:14px;margin:0;">Your LinkedIn personal brand transformation starts now.</p>
+        </div>
+        <div style="background:#1e293b;border-radius:12px;padding:24px;margin-bottom:24px;">
+          <div style="display:flex;justify-content:space-between;margin-bottom:12px;">
+            <span style="color:#64748b;font-size:13px;">Plan</span>
+            <span style="color:#fff;font-size:13px;font-weight:700;">${plan === 'enterprise' ? 'Enterprise' : 'Pro'}</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;margin-bottom:12px;">
+            <span style="color:#64748b;font-size:13px;">Amount Paid</span>
+            <span style="color:#34d399;font-size:13px;font-weight:700;">${amountDisplay}</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;margin-bottom:12px;">
+            <span style="color:#64748b;font-size:13px;">Payment ID</span>
+            <span style="color:#94a3b8;font-size:12px;">${razorpay_payment_id}</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;">
+            <span style="color:#64748b;font-size:13px;">Order ID</span>
+            <span style="color:#94a3b8;font-size:12px;">${razorpay_order_id}</span>
+          </div>
+        </div>
+        <div style="background:rgba(124,58,237,.12);border:1px solid rgba(124,58,237,.3);border-radius:12px;padding:20px;margin-bottom:24px;">
+          <h3 style="color:#a78bfa;margin:0 0 12px 0;font-size:15px;">What&#39;s unlocked for you:</h3>
+          <ul style="color:#cbd5e1;font-size:13px;margin:0;padding-left:20px;line-height:2;">
+            <li>12-Month AI Strategy generation</li>
+            <li>Daily personalised execution plans</li>
+            <li>AI content generation (posts, articles, DMs)</li>
+            <li>Human-in-loop approval workflows</li>
+            <li>Growth analytics &amp; competitor benchmarking</li>
+            ${plan === 'enterprise' ? '<li>Dedicated account manager</li><li>Custom integrations &amp; white-glove support</li>' : ''}
+          </ul>
+        </div>
+        <div style="text-align:center;">
+          <p style="color:#64748b;font-size:12px;">Questions? Reply to this email — ekodecrux@gmail.com</p>
+        </div>
+      </div>`
+
+      await sendEmailViaSMTP(env, userEmail, `🚀 LinkedBoost AI ${plan === 'enterprise' ? 'Enterprise' : 'Pro'} — Payment Confirmed!`, emailHtml)
+    }
+
+    return c.json({
+      success: true,
+      verified: true,
+      paymentId: razorpay_payment_id,
+      orderId: razorpay_order_id,
+      plan,
+      message: 'Payment verified successfully. Welcome to LinkedBoost AI!'
+    })
+  } catch (e: any) {
+    return c.json({ success: false, error: e?.message || 'Verification failed' }, 500)
+  }
+})
+
+// Get subscription status
+app.get('/api/payment/subscription/:email', async (c) => {
+  // In production this would query a database. For now return demo status.
+  const email = c.req.param('email')
+  return c.json({
+    success: true,
+    email,
+    plan: 'free',
+    status: 'active',
+    message: 'No active subscription found'
+  })
+})
+
 // Serve Main App
 app.get('*', (c) => c.html(getHtml()))
 
@@ -509,6 +672,7 @@ function getHtml(): string {
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.5.0/css/all.min.css"/>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
+<script src="https://checkout.razorpay.com/v1/checkout.js"></script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
 *{font-family:'Inter',sans-serif;box-sizing:border-box;margin:0;padding:0}
@@ -845,10 +1009,10 @@ body{background:#060d1a;color:#e2e8f0;overflow-x:hidden}
       </div>
 
       <!-- Pro Plan -->
-      <div class="plan-card featured" onclick="selectPlan('pro')">
+      <div class="plan-card featured" onclick="initiatePayment('pro')">
         <div class="absolute top-0 right-0 bg-gradient-to-l from-purple-600 to-indigo-600 text-white text-xs font-bold px-4 py-1 rounded-bl-xl rounded-tr-xl">MOST POPULAR</div>
         <div class="text-purple-400 text-sm font-semibold mb-4">PRO</div>
-        <div class="text-4xl font-black text-white mb-1">$29</div>
+        <div class="text-4xl font-black text-white mb-1">₹2,900</div>
         <div class="text-slate-500 text-sm mb-6">/month</div>
         <ul class="space-y-3 mb-8">
           <li class="flex items-center gap-2 text-sm"><i class="fas fa-check text-green-400"></i><span class="text-slate-300">Everything in Free</span></li>
@@ -859,15 +1023,15 @@ body{background:#060d1a;color:#e2e8f0;overflow-x:hidden}
           <li class="flex items-center gap-2 text-sm"><i class="fas fa-check text-green-400"></i><span class="text-slate-300">Network Builder (50 contacts/mo)</span></li>
           <li class="flex items-center gap-2 text-sm"><i class="fas fa-check text-green-400"></i><span class="text-slate-300">Growth Analytics Dashboard</span></li>
         </ul>
-        <button class="btn-pro w-full" onclick="showSignup('pro')">
-          <i class="fas fa-rocket mr-2"></i>Start Pro - $29/mo
+        <button class="btn-pro w-full" onclick="initiatePayment('pro')">
+          <i class="fas fa-rocket mr-2"></i>Get Pro — ₹2,900/mo
         </button>
       </div>
 
       <!-- Enterprise Plan -->
-      <div class="plan-card" onclick="selectPlan('enterprise')">
+      <div class="plan-card" onclick="initiatePayment('enterprise')">
         <div class="text-yellow-400 text-sm font-semibold mb-4">ENTERPRISE</div>
-        <div class="text-4xl font-black text-white mb-1">$99</div>
+        <div class="text-4xl font-black text-white mb-1">₹9,900</div>
         <div class="text-slate-500 text-sm mb-6">/month</div>
         <ul class="space-y-3 mb-8">
           <li class="flex items-center gap-2 text-sm"><i class="fas fa-check text-green-400"></i><span class="text-slate-300">Everything in Pro</span></li>
@@ -878,8 +1042,8 @@ body{background:#060d1a;color:#e2e8f0;overflow-x:hidden}
           <li class="flex items-center gap-2 text-sm"><i class="fas fa-check text-green-400"></i><span class="text-slate-300">Dedicated Account Manager</span></li>
           <li class="flex items-center gap-2 text-sm"><i class="fas fa-check text-green-400"></i><span class="text-slate-300">Custom Integrations</span></li>
         </ul>
-        <button class="btn-li w-full" onclick="showSignup('enterprise')">
-          <i class="fas fa-building mr-2"></i>Contact Sales
+        <button class="btn-li w-full" onclick="initiatePayment('enterprise')">
+          <i class="fas fa-building mr-2"></i>Get Enterprise — ₹9,900/mo
         </button>
       </div>
     </div>
@@ -1591,8 +1755,11 @@ function showSignup(plan) {
 
 function selectPlan(plan) {
   APP.plan = plan;
-  if (plan === 'free') { showPage('page-analyze'); }
-  else { showSignup(plan); }
+  if (plan === 'free') {
+    showPage('page-analyze');
+  } else {
+    initiatePayment(plan);
+  }
 }
 
 // ─── AUTH FLOW ────────────────────────────────────────────────────────────────
@@ -1895,7 +2062,7 @@ function renderAnalysisResults(a, fromAI) {
   html += '<h3 class="text-xl font-black text-white mb-2">Want to Fix All of This?</h3>';
   html += '<p class="text-slate-400 text-sm mb-6 max-w-lg mx-auto">Upgrade to Pro and get a complete 12-month strategy, AI content generation, automated execution, and human-in-loop approval workflows — all customized to your objective.</p>';
   html += '<div class="flex gap-3 justify-center flex-wrap">';
-  html += '<button class="btn-pro px-6 py-3" onclick="goToPro()"><i class="fas fa-rocket mr-2"></i>Get Pro Plan - $29/mo</button>';
+  html += '<button class="btn-pro px-6 py-3" onclick="goToPro()"><i class="fas fa-rocket mr-2"></i>Upgrade to Pro \u2014 \u20b92,900/mo</button>';
   html += '<button class="btn-ghost px-6 py-3" onclick="showPage(&#39;page-pricing&#39;)"><i class="fas fa-eye mr-2"></i>See All Features</button>';
   html += '</div></div>';
 
@@ -1914,14 +2081,15 @@ function showAnalysisError(msg) {
 
 function goToPro() {
   if (!APP.user) {
-    // Save the LinkedIn URL if already analyzed, then show signup
+    // Not logged in: go to auth first, payment after
     showSignup('pro');
-  } else if (APP.linkedinUrl && APP.analysis) {
-    // Already analyzed: go straight to objective selection
-    showPage('page-objective');
+  } else if (APP.plan === 'pro' || APP.plan === 'enterprise') {
+    // Already paid: go to objective or analyze
+    if (APP.linkedinUrl && APP.analysis) { showPage('page-objective'); }
+    else { showPage('page-analyze'); }
   } else {
-    // Logged in but no analysis: go to analyze page
-    showPage('page-analyze');
+    // Logged in but no plan: open Razorpay checkout
+    initiatePayment('pro');
   }
 }
 
@@ -2427,6 +2595,135 @@ document.addEventListener('DOMContentLoaded', function() {
     });
   });
 });
+
+// ─── RAZORPAY PAYMENT INTEGRATION ────────────────────────────────────────────
+
+async function initiatePayment(plan) {
+  if (!APP.user) {
+    APP.plan = plan;
+    showSignup(plan);
+    return;
+  }
+  showNotif('Initialising Razorpay checkout...', 'info');
+  try {
+    var res = await axios.post('/api/payment/create-order', {
+      plan: plan,
+      userEmail: APP.user.email,
+      userName: APP.user.name
+    });
+    if (!res.data.success) {
+      showNotif(res.data.error || 'Failed to create order', 'error');
+      return;
+    }
+    var order = res.data;
+    var options = {
+      key: order.keyId,
+      amount: order.amount,
+      currency: order.currency,
+      name: 'LinkedBoost AI',
+      description: order.planName + ' Monthly Subscription',
+      order_id: order.orderId,
+      prefill: {
+        name: APP.user ? APP.user.name : '',
+        email: APP.user ? APP.user.email : ''
+      },
+      notes: { plan: plan },
+      theme: { color: '#7C3AED' },
+      handler: async function(response) {
+        await handlePaymentSuccess(response, plan, order.orderId);
+      },
+      modal: {
+        ondismiss: function() {
+          showNotif('Payment cancelled. You can try again anytime.', 'info');
+        }
+      }
+    };
+    var rzp = new Razorpay(options);
+    rzp.on('payment.failed', function(response) {
+      var errMsg = response.error && response.error.description ? response.error.description : 'Payment failed';
+      showNotif('Payment failed: ' + errMsg, 'error');
+    });
+    rzp.open();
+  } catch(e) {
+    showNotif('Could not open payment. Please try again.', 'error');
+  }
+}
+
+async function handlePaymentSuccess(response, plan, orderId) {
+  showNotif('Verifying payment signature...', 'info');
+  try {
+    var verifyRes = await axios.post('/api/payment/verify', {
+      razorpay_order_id: response.razorpay_order_id,
+      razorpay_payment_id: response.razorpay_payment_id,
+      razorpay_signature: response.razorpay_signature,
+      plan: plan,
+      userEmail: APP.user ? APP.user.email : ''
+    });
+    if (verifyRes.data.success && verifyRes.data.verified) {
+      APP.plan = plan;
+      showPaymentSuccessModal(plan, response.razorpay_payment_id);
+    } else {
+      showNotif('Verification failed. Contact support with ID: ' + response.razorpay_payment_id, 'error');
+    }
+  } catch(e) {
+    showNotif('Verification error. Contact support with Payment ID: ' + response.razorpay_payment_id, 'error');
+  }
+}
+
+function showPaymentSuccessModal(plan, paymentId) {
+  var planLabel = plan === 'enterprise' ? 'Enterprise' : 'Pro';
+  var planPrice = plan === 'enterprise' ? '\u20b99,900' : '\u20b92,900';
+  var features = plan === 'enterprise'
+    ? ['Unlimited AI Content Generation','Unlimited Connection Automation','Priority AI Processing','Dedicated Account Manager','Custom Integrations','White-glove Onboarding']
+    : ['12-Month AI Strategy','Daily Execution Plans','30 AI Content Pieces/month','Human-in-Loop Approvals','Network Builder (50/mo)','Growth Analytics Dashboard'];
+
+  var featureHtml = features.map(function(f) {
+    return '<div style="display:flex;align-items:center;gap:8px;font-size:13px;color:#cbd5e1"><span style="color:#34d399;font-size:14px">&#x2713;</span>' + f + '</div>';
+  }).join('');
+
+  var emailDisplay = APP.user ? APP.user.email : 'your inbox';
+  var modal = document.createElement('div');
+  modal.id = 'payment-success-modal';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(6,13,26,.92);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(10px)';
+  modal.innerHTML =
+    '<div style="background:#0f172a;border:1px solid rgba(124,58,237,.5);border-radius:24px;max-width:480px;width:100%;padding:40px;text-align:center;box-shadow:0 40px 120px rgba(0,0,0,.7);animation:fadeInUp .4s ease">' +
+      '<div style="font-size:60px;margin-bottom:16px">&#x1F389;</div>' +
+      '<h2 style="color:#fff;font-size:24px;font-weight:900;margin:0 0 6px 0">Payment Successful!</h2>' +
+      '<p style="color:#94a3b8;font-size:14px;margin:0 0 28px 0">Welcome to LinkedBoost AI <strong style="color:#a78bfa">' + planLabel + '</strong></p>' +
+      '<div style="background:#1e293b;border-radius:12px;padding:16px 20px;margin-bottom:24px;text-align:left">' +
+        '<div style="display:flex;justify-content:space-between;margin-bottom:10px">' +
+          '<span style="color:#64748b;font-size:12px">Plan</span>' +
+          '<span style="color:#a78bfa;font-weight:700;font-size:13px">' + planLabel + ' \u2014 ' + planPrice + '/mo</span>' +
+        '</div>' +
+        '<div style="display:flex;justify-content:space-between">' +
+          '<span style="color:#64748b;font-size:12px">Payment ID</span>' +
+          '<span style="color:#64748b;font-size:11px">' + paymentId + '</span>' +
+        '</div>' +
+      '</div>' +
+      '<div style="text-align:left;display:grid;gap:10px;margin-bottom:24px">' + featureHtml + '</div>' +
+      '<p style="color:#64748b;font-size:12px;margin-bottom:24px">&#x2709;&#xFE0F;&nbsp;Confirmation email sent to <strong>' + escHtml(emailDisplay) + '</strong></p>' +
+      '<div style="display:flex;gap:12px;justify-content:center">' +
+        '<button onclick="closePaymentModal()" style="background:rgba(255,255,255,.06);color:#94a3b8;border:1px solid rgba(255,255,255,.1);border-radius:10px;padding:11px 22px;cursor:pointer;font-size:13px">Close</button>' +
+        '<button onclick="closePaymentModalAndGo()" style="background:linear-gradient(135deg,#7C3AED,#0077B5);color:#fff;border:none;border-radius:10px;padding:11px 28px;cursor:pointer;font-weight:700;font-size:13px">&#x1F680; Go to Dashboard</button>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(modal);
+}
+
+function closePaymentModal() {
+  var m = document.getElementById('payment-success-modal');
+  if (m) m.remove();
+}
+
+function closePaymentModalAndGo() {
+  closePaymentModal();
+  if (APP.linkedinUrl && APP.analysis) {
+    showPage('page-objective');
+  } else {
+    showPage('page-analyze');
+  }
+}
+
 </script>
 </body>
 </html>`
