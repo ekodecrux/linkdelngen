@@ -8,7 +8,9 @@
     "preview": "wrangler pages dev dist",
     "deploy": "npm run build && wrangler pages deploy dist",
     "deploy:prod": "npm run build && wrangler pages deploy dist --project-name linkedboost-ai",
-    "cf-typegen": "wrangler types --env-interface CloudflareBindings"
+    "cf-typegen": "wrangler types --env-interface CloudflareBindings",
+    "deploy:cf": "bash scripts/deploy.sh prod",
+    "deploy:cf:preview": "bash scripts/deploy.sh preview"
   },
   "dependencies": {
     "@types/nodemailer": "^8.0.0",

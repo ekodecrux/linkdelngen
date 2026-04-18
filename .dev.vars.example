@@ -20,3 +20,7 @@ JWT_SECRET=linkedboost-ai-secret-2025
 # Razorpay Payment Gateway (get from dashboard.razorpay.com)
 RAZORPAY_KEY_ID=rzp_test_YOUR_KEY_ID
 RAZORPAY_KEY_SECRET=YOUR_KEY_SECRET
+
+# Cloudflare Deployment (get from dash.cloudflare.com/profile/api-tokens)
+CLOUDFLARE_API_TOKEN=cfut_YOUR_API_TOKEN_HERE
+CLOUDFLARE_ACCOUNT_ID=YOUR_ACCOUNT_ID_HERE
