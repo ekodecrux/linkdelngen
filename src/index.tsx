@@ -486,8 +486,9 @@ body{background:#060d1a;color:#e2e8f0;overflow-x:hidden}
 .nav-item{display:flex;align-items:center;gap:12px;padding:10px 14px;border-radius:10px;cursor:pointer;transition:all .2s;font-size:13px;font-weight:500;color:#64748b}
 .nav-item:hover{background:rgba(255,255,255,.05);color:#94a3b8}
 .nav-item.active{background:rgba(0,119,181,.12);color:#38bdf8;border-left:2px solid #0077B5}
-.section{display:none}
+.section{display:none;min-height:100vh;background:#060d1a;width:100%}
 .section.active{display:block}
+#page-dashboard.active{display:flex}
 </style>
 </head>
 <body>
@@ -502,7 +503,7 @@ body{background:#060d1a;color:#e2e8f0;overflow-x:hidden}
 ══════════════════════════════════════════════════════════════════════════════ -->
 <section id="page-landing" class="section active min-h-screen">
   <!-- Navbar -->
-  <nav class="glass-dark fixed top-0 left-0 right-0 z-50 px-6 py-4">
+  <nav class="glass-dark sticky top-0 left-0 right-0 z-50 px-6 py-4">
     <div class="max-w-7xl mx-auto flex items-center justify-between">
       <div class="flex items-center gap-3">
         <div class="w-9 h-9 grad-li rounded-xl flex items-center justify-center">
@@ -524,7 +525,7 @@ body{background:#060d1a;color:#e2e8f0;overflow-x:hidden}
   </nav>
 
   <!-- Hero -->
-  <div class="min-h-screen flex flex-col items-center justify-center px-6 pt-20 pb-10">
+  <div class="min-h-screen flex flex-col items-center justify-center px-6 pt-8 pb-10">
     <div class="max-w-4xl mx-auto text-center">
       <div class="inline-flex items-center gap-2 bg-blue-500/10 border border-blue-500/20 rounded-full px-4 py-2 mb-8">
         <div class="pulse-dot"></div>
@@ -639,7 +640,7 @@ body{background:#060d1a;color:#e2e8f0;overflow-x:hidden}
 <!-- ═══════════════════════════════════════════════════════════════════════════
      FREE ANALYSIS PAGE
 ══════════════════════════════════════════════════════════════════════════════ -->
-<section id="page-analyze" class="section min-h-screen py-8 px-6">
+<section id="page-analyze" class="section min-h-screen py-8 px-6" style="background:#060d1a">
   <div class="max-w-3xl mx-auto">
     <!-- Header -->
     <div class="flex items-center gap-3 mb-8">
@@ -719,7 +720,7 @@ body{background:#060d1a;color:#e2e8f0;overflow-x:hidden}
 <!-- ═══════════════════════════════════════════════════════════════════════════
      PRICING PAGE
 ══════════════════════════════════════════════════════════════════════════════ -->
-<section id="page-pricing" class="section min-h-screen py-10 px-6">
+<section id="page-pricing" class="section min-h-screen py-10 px-6" style="background:#060d1a">
   <div class="max-w-5xl mx-auto">
     <div class="flex items-center gap-3 mb-10">
       <button class="btn-ghost py-2 px-3" onclick="showPage('page-landing')">
@@ -796,7 +797,7 @@ body{background:#060d1a;color:#e2e8f0;overflow-x:hidden}
 <!-- ═══════════════════════════════════════════════════════════════════════════
      AUTH / SIGNUP PAGE
 ══════════════════════════════════════════════════════════════════════════════ -->
-<section id="page-auth" class="section min-h-screen flex items-center justify-center px-6">
+<section id="page-auth" class="section min-h-screen flex items-center justify-center px-6" style="background:#060d1a">
   <div class="max-w-md w-full">
     <!-- Logo -->
     <div class="text-center mb-8">
@@ -903,7 +904,7 @@ body{background:#060d1a;color:#e2e8f0;overflow-x:hidden}
 <!-- ═══════════════════════════════════════════════════════════════════════════
      OBJECTIVE SELECTION (after auth, before dashboard)
 ══════════════════════════════════════════════════════════════════════════════ -->
-<section id="page-objective" class="section min-h-screen py-10 px-6">
+<section id="page-objective" class="section min-h-screen py-10 px-6" style="background:#060d1a">
   <div class="max-w-3xl mx-auto">
     <div class="text-center mb-10">
       <div class="w-16 h-16 grad-pro rounded-2xl flex items-center justify-center mx-auto mb-4">
@@ -1007,9 +1008,9 @@ body{background:#060d1a;color:#e2e8f0;overflow-x:hidden}
 <!-- ═══════════════════════════════════════════════════════════════════════════
      MAIN DASHBOARD
 ══════════════════════════════════════════════════════════════════════════════ -->
-<section id="page-dashboard" class="section min-h-screen flex">
+<section id="page-dashboard" class="section min-h-screen flex" style="position:relative">
   <!-- Sidebar -->
-  <aside class="w-60 glass-dark fixed left-0 top-0 bottom-0 flex flex-col py-6 px-4 z-40 border-r border-white/5">
+  <aside class="w-60 glass-dark flex-shrink-0 flex flex-col py-6 px-4 border-r border-white/5" style="position:sticky;top:0;height:100vh;overflow-y:auto">
     <div class="flex items-center gap-3 mb-8 px-2">
       <div class="w-8 h-8 grad-li rounded-lg flex items-center justify-center">
         <i class="fab fa-linkedin text-white text-sm"></i>
@@ -1077,7 +1078,7 @@ body{background:#060d1a;color:#e2e8f0;overflow-x:hidden}
   </aside>
 
   <!-- Main Content -->
-  <main class="ml-60 flex-1 min-h-screen p-6 overflow-y-auto">
+  <main class="flex-1 min-h-screen p-6 overflow-y-auto" style="max-height:100vh;overflow-y:auto">
     <!-- Tab: Overview -->
     <div id="tab-overview" class="tab-content">
       <!-- Header -->
