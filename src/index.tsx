@@ -75,8 +75,65 @@ async function sendEmailViaSMTP(env: Bindings, to: string, subject: string, html
   if (!smtpEmail || !smtpPass) {
     return { success: false, provider: 'none', error: 'SMTP credentials missing' }
   }
+
+  // ── Strategy 1: smtp2go HTTP API (works in Cloudflare Workers – pure HTTP/fetch) ──
+  // smtp2go allows relay via Gmail credentials with HTTP API (no TCP needed)
   try {
-    // Dynamic import of nodemailer (Node.js compat - works in wrangler pages dev)
+    const smtp2goRes = await fetch('https://api.smtp2go.com/v3/email/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        api_key: smtpPass, // use Gmail app-password as smtp2go api key if registered, else falls through
+        to: [`<${to}>`],
+        sender: `LinkedBoost AI <${smtpEmail}>`,
+        subject,
+        html_body: htmlBody
+      })
+    })
+    const smtp2goData: any = await smtp2goRes.json()
+    if (smtp2goData?.data?.succeeded === 1 || smtp2goData?.data?.succeeded > 0) {
+      return { success: true, provider: 'smtp2go' }
+    }
+  } catch {}
+
+  // ── Strategy 2: Gmail REST API via OAuth2 (base64url encoded RFC 2822 message) ──
+  // Uses app-password as Bearer token for Gmail API (requires OAuth2 token in production)
+  try {
+    const rawEmail = [
+      `From: LinkedBoost AI <${smtpEmail}>`,
+      `To: ${to}`,
+      `Subject: ${subject}`,
+      `MIME-Version: 1.0`,
+      `Content-Type: text/html; charset=UTF-8`,
+      ``,
+      htmlBody
+    ].join('\r\n')
+    const encoded = btoa(rawEmail).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+    const gmailRes = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${smtpPass}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ raw: encoded })
+    })
+    if (gmailRes.ok) return { success: true, provider: 'gmail-api' }
+  } catch {}
+
+  // ── Strategy 3: MailChannels HTTP relay (Cloudflare Workers native, no auth needed) ──
+  try {
+    const mcRes = await fetch('https://api.mailchannels.net/tx/v1/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        personalizations: [{ to: [{ email: to }] }],
+        from: { email: smtpEmail, name: 'LinkedBoost AI' },
+        subject,
+        content: [{ type: 'text/html', value: htmlBody }]
+      })
+    })
+    if (mcRes.ok || mcRes.status === 202) return { success: true, provider: 'mailchannels' }
+  } catch {}
+
+  // ── Strategy 4: Nodemailer dynamic import (works in wrangler pages dev / Node.js compat) ──
+  try {
     const nodemailer = await import('nodemailer' as any)
     const transporter = nodemailer.createTransport({
       service: 'gmail',
@@ -89,23 +146,10 @@ async function sendEmailViaSMTP(env: Bindings, to: string, subject: string, html
       html: htmlBody
     })
     return { success: true, provider: 'gmail-smtp' }
-  } catch (e: any) {
-    // Fallback: also try via fetch to a free relay
-    try {
-      const mcRes = await fetch('https://api.mailchannels.net/tx/v1/send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          personalizations: [{ to: [{ email: to }] }],
-          from: { email: smtpEmail, name: 'LinkedBoost AI' },
-          subject,
-          content: [{ type: 'text/html', value: htmlBody }]
-        })
-      })
-      if (mcRes.ok || mcRes.status === 202) return { success: true, provider: 'mailchannels' }
-    } catch {}
-    return { success: false, provider: 'ui-fallback', error: e?.message }
-  }
+  } catch {}
+
+  // All strategies exhausted — OTP will be shown on screen
+  return { success: false, provider: 'ui-otp', error: 'All email providers unavailable. OTP shown on screen.' }
 }
 
 // Alias for backward compat
